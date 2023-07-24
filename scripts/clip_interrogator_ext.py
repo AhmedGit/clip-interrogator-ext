@@ -3,21 +3,15 @@ import gradio as gr
 import open_clip
 import os
 import torch
-import base64
 
 from PIL import Image
 
 import clip_interrogator
-from clip_interrogator import Config, Interrogator
+from clip_interrogator import Config, Interrogator, list_caption_models, list_clip_models
 
 from modules import devices, lowvram, script_callbacks, shared
 
-from pydantic import BaseModel, Field
-from fastapi import FastAPI
-from fastapi.exceptions import HTTPException
-from io import BytesIO
-
-__version__ = "0.1.6"
+__version__ = '0.1.4'
 
 ci = None
 low_vram = False
@@ -55,21 +49,23 @@ class BatchWriter:
             self.file.close()
 
 
-def load(clip_model_name):
+def load(clip_model_name, caption_model_name):
     global ci
     if ci is None:
         print(f"Loading CLIP Interrogator {clip_interrogator.__version__}...")
-
         config = Config(
-            device=devices.get_optimal_device(),
+            device=devices.get_optimal_device(), 
             cache_path = 'models/clip-interrogator',
-            clip_model_name=clip_model_name,
-            blip_model=shared.interrogator.load_blip_model().float()
+            clip_model_name=clip_model_name
         )
+        if caption_model_name:
+            config.caption_model_name = caption_model_name
         if low_vram:
             config.apply_low_vram_defaults()
         ci = Interrogator(config)
-
+    if caption_model_name and caption_model_name != ci.config.caption_model_name:
+        ci.config.caption_model_name = caption_model_name
+        ci.load_caption_model()
     if clip_model_name != ci.config.clip_model_name:
         ci.config.clip_model_name = clip_model_name
         ci.load_clip_model()
@@ -78,14 +74,14 @@ def unload():
     global ci
     if ci is not None:
         print("Offloading CLIP Interrogator...")
-        ci.blip_model = ci.blip_model.to(devices.cpu)
+        ci.caption_model = ci.caption_model.to(devices.cpu)
         ci.clip_model = ci.clip_model.to(devices.cpu)
-        ci.blip_offloaded = True
+        ci.caption_offloaded = True
         ci.clip_offloaded = True
         devices.torch_gc()
 
 def image_analysis(image, clip_model_name):
-    load(clip_model_name)
+    load(clip_model_name, None)
 
     image = image.convert('RGB')
     image_features = ci.image_to_features(image)
@@ -101,7 +97,7 @@ def image_analysis(image, clip_model_name):
     movement_ranks = {movement: sim for movement, sim in zip(top_movements, ci.similarities(image_features, top_movements))}
     trending_ranks = {trending: sim for trending, sim in zip(top_trendings, ci.similarities(image_features, top_trendings))}
     flavor_ranks = {flavor: sim for flavor, sim in zip(top_flavors, ci.similarities(image_features, top_flavors))}
-
+    
     return medium_ranks, artist_ranks, movement_ranks, trending_ranks, flavor_ranks
 
 def interrogate(image, mode, caption=None):
@@ -119,16 +115,16 @@ def interrogate(image, mode, caption=None):
         raise Exception(f"Unknown mode {mode}")
     return prompt
 
-def image_to_prompt(image, mode, clip_model_name):
+def image_to_prompt(image, mode, clip_model_name, caption_model_name):
     shared.state.begin()
     shared.state.job = 'interrogate'
 
-    try:
+    try: 
         if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
             lowvram.send_everything_to_cpu()
             devices.torch_gc()
 
-        load(clip_model_name)
+        load(clip_model_name, caption_model_name)
         image = image.convert('RGB')
         prompt = interrogate(image, mode)
     except torch.cuda.OutOfMemoryError as e:
@@ -150,6 +146,11 @@ def about_tab():
         "CLIP models:\n"
         "* For best prompts with Stable Diffusion 1.* choose the **ViT-L-14/openai** model.\n"
         "* For best prompts with Stable Diffusion 2.* choose the **ViT-H-14/laion2b_s32b_b79k** model.\n"
+        "\nCaption models:\n"
+        "* blip-large is recommended. use blip-base if you have less than 8GB of VRAM.\n"
+        "* blip-base: 990MB, blip-large: 1.9GB\n"
+        "* git-large-coco: 1.58GB\n"
+        "* blip2-2.7b: 15.5GB, blip2-flan-t5-xl: 15.77GB\n"
         "\nOther:\n"
         "* When you are done click the **Unload** button to free up memory."
     )
@@ -165,82 +166,65 @@ def about_tab():
             vram_info += "<br>Using low VRAM configuration"
         gr.Markdown(vram_info)
 
-def get_models():
-    return ['/'.join(x) for x in open_clip.list_pretrained()]
-
 def analyze_tab():
     with gr.Column():
         with gr.Row():
             image = gr.Image(type='pil', label="Image")
-            model = gr.Dropdown(get_models(), value='ViT-L-14/openai', label='CLIP Model')
+            model = gr.Dropdown(list_clip_models(), value='ViT-L-14/openai', label='CLIP Model')
         with gr.Row():
             medium = gr.Label(label="Medium", num_top_classes=5)
-            artist = gr.Label(label="Artist", num_top_classes=5)
+            artist = gr.Label(label="Artist", num_top_classes=5)        
             movement = gr.Label(label="Movement", num_top_classes=5)
             trending = gr.Label(label="Trending", num_top_classes=5)
             flavor = gr.Label(label="Flavor", num_top_classes=5)
     button = gr.Button("Analyze", variant='primary')
     button.click(image_analysis, inputs=[image, model], outputs=[medium, artist, movement, trending, flavor])
 
-
 def batch_tab():
-    def batch_process(folder, clip_model, mode, output_mode):
+    def batch_process(folder, clip_model, caption_model, mode, output_mode):
         if not os.path.exists(folder):
-            print(f"Folder {folder} does not exist")
-            return
+            return f"Folder {folder} does not exist"
         if not os.path.isdir(folder):
-            print("{folder} is not a directory")
-            return
+            return "{folder} is not a directory"
 
         files = [f for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         if not files:
-            print("Folder has no images")
-            return
+            return "Folder has no images"
 
         shared.state.begin()
         shared.state.job = 'batch interrogate'
 
-        try:
+        try: 
             if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
                 lowvram.send_everything_to_cpu()
                 devices.torch_gc()
 
-            load(clip_model)
+            load(clip_model, caption_model)
 
             shared.total_tqdm.updateTotal(len(files))
             ci.config.quiet = True
 
             # generate captions in first pass
             captions = []
-
             for file in files:
-                try:
-                    if shared.state.interrupted:
-                        break
-                    image = Image.open(os.path.join(folder, file)).convert('RGB')
-                    caption = ci.generate_caption(image)
-                except OSError as e:
-                    print(f"{e}; continuing")
-                    caption = ""
-                finally:
-                    captions.append(caption)
-                    shared.total_tqdm.update()
+                if shared.state.interrupted:
+                    break
+                image = Image.open(os.path.join(folder, file)).convert('RGB')
+                captions.append(ci.generate_caption(image))
+                shared.total_tqdm.update()
 
             # interrogate in second pass
             writer = BatchWriter(folder, output_mode)
             shared.total_tqdm.clear()
             shared.total_tqdm.updateTotal(len(files))
             for idx, file in enumerate(files):
-                try:
-                    if shared.state.interrupted:
-                        break
-                    image = Image.open(os.path.join(folder, file)).convert('RGB')
-                    prompt = interrogate(image, mode, caption=captions[idx])
-                    writer.add(file, prompt)
-                except OSError as e:
-                    print(f" {e}, continuing")
-                finally:
-                    shared.total_tqdm.update()
+                if shared.state.interrupted:
+                    break
+                image = Image.open(os.path.join(folder, file)).convert('RGB')
+                prompt = interrogate(image, mode, caption=captions[idx])
+                writer.add(file, prompt)
+                shared.total_tqdm.update()
+
             writer.close()
             ci.config.quiet = False
             unload()
@@ -256,15 +240,16 @@ def batch_tab():
         with gr.Row():
             folder = gr.Text(label="Images folder", value="", interactive=True)
         with gr.Row():
-            clip_model = gr.Dropdown(get_models(), value='ViT-L-14/openai', label='CLIP Model')
+            clip_model = gr.Dropdown(list_clip_models(), value='ViT-L-14/openai', label='CLIP Model')
+            caption_model = gr.Dropdown(list_caption_models(), value='blip-base' if low_vram else 'blip-large', label='Caption Model')
             mode = gr.Radio(['caption', 'best', 'fast', 'classic', 'negative'], label='Prompt Mode', value='fast')
             output_mode = gr.Dropdown(BATCH_OUTPUT_MODES, value=BATCH_OUTPUT_MODES[0], label='Output Mode')
-        with gr.Row():
+        with gr.Row():        
             button = gr.Button("Go!", variant='primary')
             interrupt = gr.Button('Interrupt', visible=True)
             interrupt.click(fn=lambda: shared.state.interrupt(), inputs=[], outputs=[])
 
-    button.click(batch_process, inputs=[folder, clip_model, mode, output_mode], outputs=[])
+    button.click(batch_process, inputs=[folder, clip_model, caption_model, mode, output_mode], outputs=[])
 
 def prompt_tab():
     with gr.Column():
@@ -272,12 +257,14 @@ def prompt_tab():
             image = gr.Image(type='pil', label="Image")
             with gr.Column():
                 mode = gr.Radio(['best', 'fast', 'classic', 'negative'], label='Mode', value='best')
-                clip_model = gr.Dropdown(get_models(), value='ViT-L-14/openai', label='CLIP Model')
+                clip_model = gr.Dropdown(list_clip_models(), value='ViT-L-14/openai', label='CLIP Model')
+                caption_model = gr.Dropdown(list_caption_models(), value='blip-base' if low_vram else 'blip-large', label='Caption Model')
+                list_caption_models
         prompt = gr.Textbox(label="Prompt", lines=3)
     with gr.Row():
         button = gr.Button("Generate", variant='primary')
         unload_button = gr.Button("Unload")
-    button.click(image_to_prompt, inputs=[image, mode, clip_model], outputs=prompt)
+    button.click(image_to_prompt, inputs=[image, mode, clip_model, caption_model], outputs=prompt)
     unload_button.click(unload)
 
 
@@ -302,72 +289,4 @@ def add_tab():
 
     return [(ui, "Interrogator", "interrogator")]
 
-# decode_base64_to_image from modules/api/api.py, could be imported from there
-def decode_base64_to_image(encoding):
-    if encoding.startswith("data:image/"):
-        encoding = encoding.split(";")[1].split(",")[1]
-    try:
-        image = Image.open(BytesIO(base64.b64decode(encoding)))
-        return image
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Invalid encoded image") from e
-
-class InterrogatorAnalyzeRequest(BaseModel):
-    image: str = Field(
-        default="",
-        title="Image",
-        description="Image to work on, must be a Base64 string containing the image's data.",
-    )
-    clip_model_name: str = Field(
-        default="ViT-L-14/openai",
-        title="Model",
-        description="The interrogate model used. See the models endpoint for a list of available models.",
-    )
-
-class InterrogatorPromptRequest(InterrogatorAnalyzeRequest):
-    mode: str = Field(
-        default="fast",
-        title="Mode",
-        description="The mode used to generate the prompt. Can be one of: best, fast, classic, negative.",
-    )
-
-def mount_interrogator_api(_: gr.Blocks, app: FastAPI):
-    @app.get("/interrogator/models")
-    async def get_models():
-        return ["/".join(x) for x in open_clip.list_pretrained()]
-
-    @app.post("/interrogator/prompt")
-    async def get_prompt(analyzereq: InterrogatorPromptRequest):
-        image_b64 = analyzereq.image
-        if image_b64 is None:
-            raise HTTPException(status_code=404, detail="Image not found")
-
-        img = decode_base64_to_image(image_b64)
-        prompt = image_to_prompt(img, analyzereq.mode, analyzereq.clip_model_name)
-        return {"prompt": prompt}
-
-    @app.post("/interrogator/analyze")
-    async def analyze(analyzereq: InterrogatorAnalyzeRequest):
-        image_b64 = analyzereq.image
-        if image_b64 is None:
-            raise HTTPException(status_code=404, detail="Image not found")
-
-        img = decode_base64_to_image(image_b64)
-        (
-            medium_ranks,
-            artist_ranks,
-            movement_ranks,
-            trending_ranks,
-            flavor_ranks,
-        ) = image_analysis(img, analyzereq.clip_model_name)
-        return {
-            "medium": medium_ranks,
-            "artist": artist_ranks,
-            "movement": movement_ranks,
-            "trending": trending_ranks,
-            "flavor": flavor_ranks,
-        }
-
-
-script_callbacks.on_app_started(mount_interrogator_api)
 script_callbacks.on_ui_tabs(add_tab)
